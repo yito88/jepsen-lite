@@ -6,7 +6,8 @@
    Note what is *not* here: no `jepsen.client/Client`, no test map, no
    generator, no checker. A user writes an adapter and a handler, and picks a
    workload."
-  (:require [lite.client :as client :refer [fail!]]
+  (:require [clojure.string :as str]
+            [lite.client :as client :refer [fail!]]
             [lite.core :as core]))
 
 ;; ## The adapter
@@ -24,18 +25,40 @@
 (defrecord Adapter [handler init instance]
   client/ClientAdapter
   (open [_]
+    ;; Durable: the data lives outside any one instance, so a crash costs the
+    ;; connection but not what was committed through it.
     (swap! instance #(or % (atom (init)))))
 
   (invoke [_ conn op]
     (client/complete handler conn op))
 
   (close [_ _conn]
-    ;; Dropping a client handle leaves the instance running. Discarding the
-    ;; instance itself is a fault, and belongs to the crash nemesis.
+    ;; Dropping a client handle leaves the data where it is. Discarding the
+    ;; instance is a fault, and belongs to the crash nemesis.
     nil))
 
-(defn adapter [init]
+(defrecord VolatileAdapter [handler init]
+  client/ClientAdapter
+  (open [_]
+    ;; The defect this one is here to show: the data lives *in* the instance, so
+    ;; every crash starts from nothing and acknowledged writes evaporate.
+    (atom (init)))
+
+  (invoke [_ conn op]
+    (client/complete handler conn op))
+
+  (close [_ _conn]
+    nil))
+
+(defn adapter
+  "A target whose data survives a crash."
+  [init]
   (map->Adapter {:init init, :instance (atom nil)}))
+
+(defn volatile-adapter
+  "A target whose data does not."
+  [init]
+  (map->VolatileAdapter {:init init}))
 
 ;; ## :register -- a map of keys to registers
 ;;
@@ -164,28 +187,63 @@
               :broken  (bank-handler broken-transfer!)}})
 
 (defn config
-  "A run config for one workload, against either the correct target or the
-   broken one."
-  ([workload] (config workload :correct))
-  ([workload variant]
+  "A run config for one workload. Options:
+
+     :variant     :correct (default) or :broken -- is the handler right?
+     :durability  :durable (default) or :volatile -- does data survive a crash?
+     :nemesis     faults to inject, e.g. [:crash]"
+  ([workload] (config workload {}))
+  ([workload {:keys [variant durability nemesis]
+              :or   {variant :correct, durability :durable}}]
    (let [demo (get demos workload)]
      (assert demo (str "No demo for workload " (pr-str workload)))
-     {:adapter  (adapter (:init demo))
-      :handler  (get demo variant)
-      :workload workload
-      :name     (str "jepsen-lite-demo-" (name workload))
-      :target   {:type :in-process}})))
+     (cond-> {:adapter  ((case durability
+                           :durable  adapter
+                           :volatile volatile-adapter)
+                         (:init demo))
+              :handler  (get demo variant)
+              :workload workload
+              :name     (str "jepsen-lite-demo-" (name workload))
+              :target   {:type :in-process}}
+       nemesis (assoc :nemesis nemesis
+                      ;; An in-memory target answers in microseconds, so these
+                      ;; runs are over in a few dozen milliseconds. Crash far
+                      ;; more often than a real run would, or the fault would
+                      ;; land after everything already happened.
+                      :nemesis-opts {:crashes 8, :crash-interval 1/500})))))
+
+(defn- parse-args
+  "Words in any order: a workload name, plus any of broken / crash / volatile."
+  [args]
+  (let [args (set args)]
+    [(or (first (filter (comp args name) (keys demos))) :register)
+     (cond-> {}
+       (args "broken")   (assoc :variant :broken)
+       (args "volatile") (assoc :durability :volatile)
+       (args "crash")    (assoc :nemesis [:crash]))]))
+
+(defn- expected-valid?
+  "What a well-wired Lite should say about this demo: only a broken handler, or
+   a target that loses data when it's crashed, should come back invalid."
+  [{:keys [variant durability nemesis]}]
+  (and (not= :broken variant)
+       (not (and (seq nemesis) (= :volatile durability)))))
 
 (defn -main
-  "`clojure -M:run [workload] [broken]`, e.g. `clojure -M:run bank broken`.
-   Defaults to the correct register."
+  "`clojure -M:run [workload] [broken] [crash] [volatile]`, e.g.
+
+     clojure -M:run bank broken         ; a handler that loses money
+     clojure -M:run set crash           ; crashes, but the data survives them
+     clojure -M:run set crash volatile  ; crashes that take the data with them
+
+   Exits non-zero if the verdict isn't the one the demo is meant to produce."
   [& args]
-  (let [args     (set args)
-        broken?  (contains? args "broken")
-        workload (or (first (filter (comp args name) (keys demos))) :register)
-        variant  (if broken? :broken :correct)
-        {:keys [valid?]} (core/run (config workload variant))]
-    (println (str "\n" (name workload) " (" (name variant) "): :valid? "
-                  (pr-str valid?)))
+  (let [[workload opts] (parse-args args)
+        {:keys [valid?]} (core/run (config workload opts))
+        labels (cond-> [(name workload)]
+                 (= :broken (:variant opts))      (conj "broken")
+                 (seq (:nemesis opts))            (conj "crash")
+                 (= :volatile (:durability opts)) (conj "volatile"))]
+    (println (str "\n" (str/join " " labels) ": :valid? " (pr-str valid?)))
     (shutdown-agents)
-    (System/exit (if (= valid? (not broken?)) 0 1))))
+    (System/exit (if (= valid? (expected-valid? opts)) 0 1))))

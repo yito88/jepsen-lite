@@ -27,9 +27,28 @@ workload's checker → a verdict. All four v1 workloads are in:
 
 Each ships a correct demo target and a deliberately broken one:
 
-    clojure -M:run                # correct register -> :valid? true
-    clojure -M:run bank broken    # <workload> [broken]
+    clojure -M:run                     # correct register -> :valid? true
+    clojure -M:run bank broken         # <workload> [broken] [crash] [volatile]
+    clojure -M:run set crash           # crashes, data survives -> :valid? true
+    clojure -M:run set crash volatile  # crashes lose data     -> :valid? false
     clojure -M:test
+
+## Faults
+
+Faults are asked for by intent — `:nemesis [:crash]` — and which ones are
+possible depends on how the target is deployed, not on the workload:
+
+| target-type | `:crash` | `:pause` | `:partition` |
+|---|---|---|---|
+| `:http` | ✗ | ✗ | ✗ |
+| `:in-process` | ✓ | ✗ | ✗ |
+| `:local-process` | ✓ | ✓ | ✗ |
+| `:compose` | ✓ | ✓ | ✓ |
+
+Asking for one of the ✗ combinations stops the run before it starts, with what
+went wrong, why, and what to do instead. Only `:in-process` is runnable so far;
+its crash destroys the target instance and creates a new one, which is what
+`ClientAdapter`'s re-runnable `open`/`close` are for.
 
 A user writes a **ClientAdapter**, a **handler**, and picks a `:workload`;
 `lite.core/run` returns `{:valid? ..., :results ..., :history ...}`. Each

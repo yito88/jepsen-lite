@@ -1,0 +1,103 @@
+(ns lite.nemesis-test
+  "M4 acceptance: the crash nemesis perturbs an in-process target, and axis-2
+   validation refuses the combinations that can't work."
+  (:require [clojure.string :as str]
+            [clojure.test :refer [deftest is testing]]
+            [lite.core :as core]
+            [lite.demo :as demo]
+            [lite.nemesis :as nemesis]
+            [lite.target :as target]))
+
+;; ## Axis-2 validation
+
+(deftest the-table-covers-every-target-type-and-intent
+  (is (= (set target/target-types) (set (keys nemesis/validity))))
+  (doseq [[target-type row] nemesis/validity]
+    (is (= (set nemesis/intents) (set (keys row)))
+        (str target-type " is missing an intent"))))
+
+(deftest in-process-accepts-crash
+  (is (= [:crash] (nemesis/validate! :in-process [:crash])))
+  (is (nil? (core/validate! (demo/config :set {:nemesis [:crash]})))))
+
+(deftest in-process-refuses-what-it-cannot-do
+  (doseq [intent [:pause :partition]]
+    (testing intent
+      (let [e (is (thrown? clojure.lang.ExceptionInfo
+                           (nemesis/validate! :in-process [intent])))
+            msg (ex-message e)]
+        (is (= :invalid-nemesis (:lite/error (ex-data e))))
+        (testing "says what, why and how to fix it"
+          (is (str/includes? msg (str intent)))
+          (is (str/includes? msg ":in-process"))
+          (is (str/includes? msg "why:"))
+          (is (str/includes? msg "fix:"))
+          ;; The fix names the alternative that works here, and the
+          ;; target-types where the intent the user asked for is possible.
+          (is (str/includes? msg "crash"))
+          (is (str/includes? msg ":compose")))))))
+
+(deftest validation-happens-before-the-run
+  ;; No adapter, no handler, no workload: if this got as far as running
+  ;; anything it would fail some other way.
+  (let [e (is (thrown? clojure.lang.ExceptionInfo
+                       (core/run {:target {:type :in-process}, :nemesis [:pause]})))]
+    (is (= :invalid-nemesis (:lite/error (ex-data e))))))
+
+(deftest unknown-names-are-rejected
+  (testing "an intent that doesn't exist"
+    (let [e (is (thrown? clojure.lang.ExceptionInfo
+                         (nemesis/validate! :in-process [:reboot])))]
+      (is (= :unknown-nemesis (:lite/error (ex-data e))))))
+
+  (testing "a target-type that doesn't exist"
+    (let [e (is (thrown? clojure.lang.ExceptionInfo
+                         (core/validate! {:target {:type :carrier-pigeon}})))]
+      (is (= :unusable-target-type (:lite/error (ex-data e))))))
+
+  (testing "a target-type in the design but not implemented yet"
+    (let [e (is (thrown? clojure.lang.ExceptionInfo
+                         (core/validate! {:target {:type :compose}})))]
+      (is (= :unusable-target-type (:lite/error (ex-data e))))
+      (is (str/includes? (ex-message e) "isn't implemented yet")))))
+
+;; ## The crash nemesis
+
+(defn- crashes
+  "Completed crash ops from the nemesis."
+  [history]
+  (filter (fn [op] (and (= :crash (:f op)) (= :info (:type op)) (:value op)))
+          history))
+
+(def durable (delay (core/run (demo/config :set {:nemesis [:crash]}))))
+
+(deftest crashes-happen-repeatedly-during-the-run
+  (let [{:keys [history]} @durable
+        cs (crashes history)]
+    (is (< 1 (count cs)) "one run, many crashes")
+    (is (= (range 1 (inc (count cs))) (map :value cs))
+        "each crash really did destroy and re-create the instance")
+    (is (every? #{:nemesis} (map :process cs)))
+
+    (testing "clients keep working across them"
+      ;; If the bridge had captured the instance at open! instead of reading it
+      ;; per op, every client op after the first crash would have failed.
+      (let [after (filter (fn [op] (< (:time (first cs)) (:time op))) history)]
+        (is (some (fn [op] (and (= :ok (:type op)) (number? (:process op))))
+                  after))))))
+
+(deftest a-target-that-survives-crashes-still-checks-out
+  (is (true? (:valid? @durable))))
+
+(deftest a-target-that-loses-data-when-crashed-is-caught
+  (let [{:keys [valid? results]} (core/run (demo/config :set {:nemesis [:crash]
+                                                              :durability :volatile}))]
+    (is (false? valid?))
+    (testing "as lost writes, not as an error"
+      (is (pos? (:lost-count results)))
+      (is (zero? (:unexpected-count results))))))
+
+(deftest without-a-nemesis-nothing-crashes
+  (let [{:keys [valid? history]} (core/run (demo/config :set))]
+    (is (true? valid?))
+    (is (empty? (crashes history)))))

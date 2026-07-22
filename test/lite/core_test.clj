@@ -7,7 +7,7 @@
             [lite.workload :as workload]))
 
 (defn run [workload variant]
-  (core/run (demo/config workload variant)))
+  (core/run (demo/config workload {:variant variant})))
 
 (def correct-register (delay (run :register :correct)))
 
