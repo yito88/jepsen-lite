@@ -33,6 +33,9 @@
                 ;; in here.
                 (cond-> adapter handler (assoc :handler handler)))]
     (merge tests/noop-test
+           ;; Whatever the workload's own generator and checker need to find in
+           ;; the test map.
+           (:test-opts w)
            {:pure-generators true
             :name            (or name "jepsen-lite")
             :nodes           nodes

@@ -33,7 +33,7 @@
              (select-keys (client/complete (fn [_ _] nil) nil op) [:f :process]))))))
 
 (deftest open-and-close-are-re-runnable
-  (let [a (demo/adapter)]
+  (let [a (demo/adapter (constantly {}))]
     (dotimes [_ 3]
       (let [conn (client/open a)]
         (is (some? conn))

@@ -12,15 +12,23 @@ Two orthogonal axes:
 2. **target-type** — `:in-process` / `:local-process` / `:http` / `:compose`;
    the deploy / lifecycle method, which decides what faults can be injected.
 
-## Status: M2
+## Status: M3
 
 The pipeline runs end to end: a workload's generator → the user's ClientAdapter
 (bridged to `jepsen.client/Client` internally) → a `jepsen.history` → the
-workload's checker → a verdict. One workload so far, `:register`, checked for
-linearizability by Knossos.
+workload's checker → a verdict. All four v1 workloads are in:
 
-    clojure -M:run          # correct register  -> :valid? true
-    clojure -M:run broken   # defective register -> :valid? false
+| `:workload` | Checks | Needs from the target |
+|---|---|---|
+| `:register` | linearizability (Knossos) | compare-and-set |
+| `:set` | lost writes / phantom elements | nothing special |
+| `:bank` | total balance is conserved | multi-key atomic transactions |
+| `:counter` | reads stay within the increment range (lenient) | nothing special |
+
+Each ships a correct demo target and a deliberately broken one:
+
+    clojure -M:run                # correct register -> :valid? true
+    clojure -M:run bank broken    # <workload> [broken]
     clojure -M:test
 
 A user writes a **ClientAdapter**, a **handler**, and picks a `:workload`;

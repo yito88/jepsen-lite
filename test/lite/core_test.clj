@@ -1,18 +1,54 @@
 (ns lite.core-test
-  "M2 acceptance: the register workload runs end to end, and the checker
+  "M3 acceptance: every workload runs end to end, and every checker
    discriminates -- correct target valid, broken target invalid."
   (:require [clojure.test :refer [deftest is testing]]
             [lite.core :as core]
-            [lite.demo :as demo]))
+            [lite.demo :as demo]
+            [lite.workload :as workload]))
 
-(def correct (delay (core/run (demo/config demo/handler))))
-(def broken (delay (core/run (demo/config demo/broken-handler))))
+(defn run [workload variant]
+  (core/run (demo/config workload variant)))
 
-(deftest correct-register-is-linearizable
-  (let [{:keys [valid? history]} @correct]
-    (is (true? valid?))
+(def correct-register (delay (run :register :correct)))
 
-    (testing "the history is well-formed"
+(deftest every-workload-is-checked-in-both-directions
+  (doseq [workload (keys workload/workloads)]
+    (testing (str (name workload) ", correct target")
+      (is (true? (:valid? (if (= :register workload)
+                            @correct-register
+                            (run workload :correct))))))
+
+    (testing (str (name workload) ", broken target")
+      (is (false? (:valid? (run workload :broken)))))))
+
+(deftest broken-targets-fail-for-the-right-reason
+  (testing "register: a CAS no linearization allows"
+    (let [{:keys [results]} (run :register :broken)
+          failed (->> (:results results) vals (remove :valid?) (map :linearizable))]
+      (is (seq (:failures results)))
+      (is (seq failed))
+      ;; Knossos explains itself: it reached an op no linearization allows.
+      (is (every? (comp seq :final-paths) failed))))
+
+  (testing "set: acknowledged adds missing from the final read"
+    (let [{:keys [results]} (run :set :broken)]
+      (is (pos? (:lost-count results)))
+      (is (zero? (:unexpected-count results)))))
+
+  (testing "bank: money that stops adding up"
+    (let [{:keys [results]} (run :bank :broken)]
+      (is (contains? (:errors results) :wrong-total))
+      (is (pos? (:error-count results)))))
+
+  (testing "counter: reads below the acknowledged sum"
+    (let [{:keys [results]} (run :counter :broken)
+          [lower value _upper] (first (:errors results))]
+      (is (seq (:errors results)))
+      (is (< value lower)))))
+
+(deftest correct-register-history-is-well-formed
+  (let [{:keys [history]} @correct-register]
+    (testing "every invocation has a matching completion"
       ;; A process is sequential, so its ops alternate invoke, completion, ...
       ;; Jepsen would have thrown :jepsen.client/invalid-completion during the
       ;; run had the bridge dropped :process or :f.
@@ -36,17 +72,5 @@
                               (some? (val (:value op)))))
                 history)))))
 
-(deftest broken-register-is-caught
-  (let [{:keys [valid? results]} @broken
-        per-key (:results results)]
-    (is (false? valid?))
-
-    (testing "it fails as a linearizability violation, not an error"
-      (is (seq (:failures results)))
-      (let [failed (->> (vals per-key)
-                        (remove :valid?)
-                        (map :linearizable))]
-        (is (seq failed))
-        (is (every? false? (map :valid? failed)))
-        ;; Knossos explains itself: it reached an op no linearization allows.
-        (is (every? (comp seq :final-paths) failed))))))
+(deftest unknown-workload-is-rejected
+  (is (thrown? clojure.lang.ExceptionInfo (workload/build :nope {}))))
