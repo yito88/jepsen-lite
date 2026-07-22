@@ -1,7 +1,9 @@
 (ns lite.core
-  "The runner. M0's hand-rolled loop over a hardcoded op list is replaced here
-   by Jepsen's generator interpreter, which supplies ops, spawns workers, and
-   records a real `jepsen.history`. No checker runs yet."
+  "The runner: config in, verdict out.
+
+   A run is Jepsen's own pipeline with the parts a Lite user shouldn't have to
+   see kept internal -- generator -> the user's adapter (via the bridge) ->
+   history -> the workload's checker."
   (:require [clojure.pprint :as pprint]
             [jepsen.core :as jepsen]
             [jepsen.generator.interpreter :as interpreter]
@@ -10,23 +12,35 @@
             [jepsen.tests :as tests]
             [jepsen.util :as util]
             [lite.bridge :as bridge]
-            [lite.gen :as gen]))
+            [lite.workload :as workload]))
+
+(def default-nodes
+  "An in-process target is one logical node. Later target-types supply their
+   own; nothing here branches on which."
+  ["local"])
 
 (defn test-map
   "Builds the Jepsen test map for `config`. Everything not named here keeps
-   `noop-test`'s defaults: a noop os/db/nemesis/checker is correct for an
-   in-process target, which has no node to configure."
-  [{:keys [adapter handler generator concurrency name]}]
-  (merge tests/noop-test
-         {:pure-generators true
-          :name            (or name "jepsen-lite")
-          :concurrency     (or concurrency 5)
-          :client          (bridge/client
-                            ;; `invoke` takes no handler argument, so the
-                            ;; adapter carries it. The config is the
-                            ;; user-facing place to put it; bind it in here.
-                            (cond-> adapter handler (assoc :handler handler)))
-          :generator       (or generator gen/default)}))
+   `noop-test`'s defaults: a noop os/db/nemesis is correct for an in-process
+   target, which has no node to configure."
+  [{:keys [adapter handler workload workload-opts concurrency name nodes]}]
+  (let [nodes (or nodes default-nodes)
+        w     (workload/build (or workload :register)
+                              (assoc workload-opts :nodes nodes))
+        client (bridge/client
+                ;; `invoke` takes no handler argument, so the adapter carries
+                ;; it. The config is the user-facing place to put it; bind it
+                ;; in here.
+                (cond-> adapter handler (assoc :handler handler)))]
+    (merge tests/noop-test
+           {:pure-generators true
+            :name            (or name "jepsen-lite")
+            :nodes           nodes
+            :concurrency     (or concurrency (:concurrency w) (count nodes))
+            :client          (cond-> client
+                               (:wrap-client w) ((:wrap-client w)))
+            :generator       (:generator w)
+            :checker         (:checker w)})))
 
 (defn- realize-history
   "The history `with-history!` hands back reads its chunks from the store file
@@ -39,30 +53,39 @@
 (defn run
   "Runs `config`:
 
-     {:adapter     <a ClientAdapter>
-      :handler     (fn [conn op] ...)  ; the user's op -> target-call mapping
-      :generator   <a jepsen generator> ; optional; `lite.gen/default` otherwise
-      :concurrency <n>                  ; optional
-      :name        \"...\"              ; optional
-      :target      {:type :in-process}} ; carried for later milestones; unused
+     {:adapter       <a ClientAdapter>
+      :handler       (fn [conn op] ...) ; the user's op -> target-call mapping
+      :workload      :register          ; optional; :register is the default
+      :workload-opts {...}              ; optional; see the workload's ns
+      :concurrency   <n>                ; optional; the workload picks otherwise
+      :name          \"...\"            ; optional
+      :target        {:type :in-process}} ; carried for later milestones; unused
 
-   Interprets the generator against the user's adapter and returns the
-   resulting `jepsen.history`, which is also printed.
+   Interprets the workload's generator against the user's adapter, checks the
+   resulting history, and returns `{:valid? ..., :results ..., :history ...}`.
+   The verdict is printed and, like the history, written to `store/`.
 
    `prepare-test` supplies the `:start-time`/`:concurrency`/`:barrier` the
-   interpreter needs and makes the generator forgettable; the store handle is
-   opened because the interpreter asserts a `:history-writer`. Nothing reads
-   that store back — result persistence and analysis come with the checker."
+   interpreter needs and makes the generator forgettable; the store handle has
+   to be open for the interpreter's history writer, and stays open through
+   analysis so the checker's results land next to the history."
   [config]
   (let [test (jepsen/prepare-test (test-map config))
-        history (store/with-handle [test test]
-                  ;; save-0! writes the initial test; the history writer refuses
-                  ;; to open without the block id it leaves in the test's meta.
-                  (let [test (store/save-0! test)]
-                    (util/with-relative-time
-                      (-> (store/with-history! [test test]
-                            (interpreter/run! test))
-                          :history
-                          realize-history))))]
-    (run! pprint/pprint history)
-    history))
+        test (store/with-handle [test test]
+               ;; save-0! writes the initial test; the history writer refuses to
+               ;; open without the block id it leaves in the test's metadata.
+               (let [test (store/save-0! test)
+                     test (util/with-relative-time
+                            (store/with-history! [test test]
+                              (interpreter/run! test)))]
+                 (-> test
+                     (update :history realize-history)
+                     store/save-1!
+                     ;; Runs the checker and writes the results out.
+                     jepsen/analyze!)))
+        results (:results test)]
+    (println "\nVerdict:")
+    (pprint/pprint results)
+    {:valid?  (:valid? results)
+     :results results
+     :history (:history test)}))

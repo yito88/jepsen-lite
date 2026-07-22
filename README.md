@@ -12,19 +12,26 @@ Two orthogonal axes:
 2. **target-type** — `:in-process` / `:local-process` / `:http` / `:compose`;
    the deploy / lifecycle method, which decides what faults can be injected.
 
-## Status: M1
+## Status: M2
 
-Ops from a `jepsen.generator` flow through the user's ClientAdapter — bridged to
-`jepsen.client/Client` internally — and are recorded into a `jepsen.history` of
-paired `:invoke` → `:ok`/`:fail`/`:info` operations, which is printed and
-returned. No checker yet, and no real workloads.
+The pipeline runs end to end: a workload's generator → the user's ClientAdapter
+(bridged to `jepsen.client/Client` internally) → a `jepsen.history` → the
+workload's checker → a verdict. One workload so far, `:register`, checked for
+linearizability by Knossos.
 
-    clojure -M:run     # runs the demo in src/lite/demo.clj
+    clojure -M:run          # correct register  -> :valid? true
+    clojure -M:run broken   # defective register -> :valid? false
     clojure -M:test
+
+A user writes a **ClientAdapter**, a **handler**, and picks a `:workload`;
+`lite.core/run` returns `{:valid? ..., :results ..., :history ...}`. Each
+workload documents its handler contract in its own namespace — see
+`lite.workload.register`.
 
 Handlers signal outcomes by throwing: return normally for `:ok`, call
 `(lite.client/fail! msg)` for a certain failure, `(lite.client/info! reason)` for
-an indeterminate one. Any other exception is treated as `:info`.
+an indeterminate one. Any other exception is treated as `:info`. A CAS mismatch
+is an ordinary `:fail`, and a history full of them is still linearizable.
 
-Runs write a store file under `store/` (gitignored). Jepsen's history writer
-requires it; nothing reads it back until the checker arrives.
+Runs write their history and results under `store/` (gitignored), in Jepsen's
+normal store layout.

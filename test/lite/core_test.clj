@@ -1,21 +1,22 @@
 (ns lite.core-test
-  "M1 acceptance: the demo, driven by Jepsen's generator interpreter, produces a
-   well-formed history."
+  "M2 acceptance: the register workload runs end to end, and the checker
+   discriminates -- correct target valid, broken target invalid."
   (:require [clojure.test :refer [deftest is testing]]
             [lite.core :as core]
             [lite.demo :as demo]))
 
-(def history (delay (core/run demo/config)))
+(def correct (delay (core/run (demo/config demo/handler))))
+(def broken (delay (core/run (demo/config demo/broken-handler))))
 
-(deftest history-is-well-formed
-  (let [h @history]
-    (is (seq h))
+(deftest correct-register-is-linearizable
+  (let [{:keys [valid? history]} @correct]
+    (is (true? valid?))
 
-    (testing "every invocation is followed by a matching completion"
-      ;; A process is sequential, so its ops alternate invoke, completion,
-      ;; invoke, ... This is what Jepsen validates as well; a mismatch would
-      ;; have thrown :jepsen.client/invalid-completion during the run.
-      (doseq [[process ops] (group-by :process h)
+    (testing "the history is well-formed"
+      ;; A process is sequential, so its ops alternate invoke, completion, ...
+      ;; Jepsen would have thrown :jepsen.client/invalid-completion during the
+      ;; run had the bridge dropped :process or :f.
+      (doseq [[process ops] (group-by :process history)
               [invoke complete] (partition-all 2 ops)]
         (is (= :invoke (:type invoke)) (str "process " process))
         (is (some? complete) "no dangling invocation")
@@ -23,16 +24,29 @@
         (is (= (:process invoke) (:process complete)))
         (is (= (:f invoke) (:f complete)))))
 
-    (testing "outcomes cover a normal return, a fail! and an info!"
-      (let [types (set (map :type h))]
-        (is (contains? types :ok))
-        (is (contains? types :info))    ; the simulated timeout
-        (is (contains? types :fail))))  ; a cas mismatch
+    (testing "cas mismatches happen, and are not violations in themselves"
+      (is (some (fn [op] (and (= :fail (:type op)) (= :cas (:f op))))
+                history)))
 
-    (testing "reads see writes: the workers share one register"
-      ;; Every worker opens its own client, so a non-nil read proves they are
-      ;; all talking to the same instance rather than to private copies.
+    (testing "reads see writes: the workers share one store"
+      ;; Every worker opens its own client, so a read of a written value proves
+      ;; they are all talking to the same instance, not to private copies.
       (is (some (fn [op] (and (= :ok (:type op))
                               (= :read (:f op))
-                              (some? (:value op))))
-                h)))))
+                              (some? (val (:value op)))))
+                history)))))
+
+(deftest broken-register-is-caught
+  (let [{:keys [valid? results]} @broken
+        per-key (:results results)]
+    (is (false? valid?))
+
+    (testing "it fails as a linearizability violation, not an error"
+      (is (seq (:failures results)))
+      (let [failed (->> (vals per-key)
+                        (remove :valid?)
+                        (map :linearizable))]
+        (is (seq failed))
+        (is (every? false? (map :valid? failed)))
+        ;; Knossos explains itself: it reached an op no linearization allows.
+        (is (every? (comp seq :final-paths) failed))))))
