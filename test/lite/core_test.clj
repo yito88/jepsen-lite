@@ -3,11 +3,11 @@
    discriminates -- correct target valid, broken target invalid."
   (:require [clojure.test :refer [deftest is testing]]
             [lite.core :as core]
-            [lite.demo :as demo]
+            [lite.targets :as targets]
             [lite.workload :as workload]))
 
 (defn run [workload variant]
-  (core/run (demo/config workload {:variant variant})))
+  (core/run (targets/config workload {:variant variant})))
 
 (def correct-register (delay (run :register :correct)))
 

@@ -4,9 +4,9 @@
   (:require [clojure.string :as str]
             [clojure.test :refer [deftest is testing]]
             [lite.core :as core]
-            [lite.demo :as demo]
             [lite.nemesis :as nemesis]
-            [lite.target :as target]))
+            [lite.target :as target]
+            [lite.targets :as targets]))
 
 ;; ## Axis-2 validation
 
@@ -18,7 +18,7 @@
 
 (deftest in-process-accepts-crash
   (is (= [:crash] (nemesis/validate! :in-process [:crash])))
-  (is (nil? (core/validate! (demo/config :set {:nemesis [:crash]})))))
+  (is (nil? (core/validate! (targets/config :set {:nemesis [:crash]})))))
 
 (deftest in-process-refuses-what-it-cannot-do
   (doseq [intent [:pause :partition]]
@@ -69,7 +69,7 @@
   (filter (fn [op] (and (= :crash (:f op)) (= :info (:type op)) (:value op)))
           history))
 
-(def durable (delay (core/run (demo/config :set {:nemesis [:crash]}))))
+(def durable (delay (core/run (targets/config :set {:nemesis [:crash]}))))
 
 (deftest crashes-happen-repeatedly-during-the-run
   (let [{:keys [history]} @durable
@@ -90,14 +90,14 @@
   (is (true? (:valid? @durable))))
 
 (deftest a-target-that-loses-data-when-crashed-is-caught
-  (let [{:keys [valid? results]} (core/run (demo/config :set {:nemesis [:crash]
-                                                              :durability :volatile}))]
+  (let [{:keys [valid? results]} (core/run (targets/config :set {:nemesis [:crash]
+                                                                 :durability :volatile}))]
     (is (false? valid?))
     (testing "as lost writes, not as an error"
       (is (pos? (:lost-count results)))
       (is (zero? (:unexpected-count results))))))
 
 (deftest without-a-nemesis-nothing-crashes
-  (let [{:keys [valid? history]} (core/run (demo/config :set))]
+  (let [{:keys [valid? history]} (core/run (targets/config :set))]
     (is (true? valid?))
     (is (empty? (crashes history)))))

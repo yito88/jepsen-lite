@@ -1,18 +1,16 @@
-(ns lite.demo
-  "Worked examples: for each workload, an embedded target that is correct and
-   one with a deliberate defect. Running both is how we know a checker
-   discriminates -- a checker that only ever passes has not been shown to work.
+(ns lite.targets
+  "In-memory targets the tests run against: for each workload, one that behaves
+   and one with a deliberate defect, plus a variant that loses its data whenever
+   it is crashed.
 
-   Note what is *not* here: no `jepsen.client/Client`, no test map, no
-   generator, no checker. A user writes an adapter and a handler, and picks a
-   workload."
-  (:require [clojure.string :as str]
-            [lite.client :as client :refer [fail!]]
-            [lite.core :as core]))
+   These are fixtures, not the library and not the examples -- the test suite
+   stands on its own. `examples/demo/kvs.clj` shows the same ideas as something
+   a user would read."
+  (:require [lite.client :as client :refer [fail!]]))
 
 ;; ## The adapter
 ;;
-;; One adapter serves every demo: it knows the calling convention of an
+;; One adapter serves every fixture: it knows the calling convention of an
 ;; in-memory store (an atom holding some state) and the connection lifecycle,
 ;; and nothing about how that store is deployed.
 ;;
@@ -169,9 +167,9 @@
       :read     @accts
       :transfer (transfer-fn accts value))))
 
-;; ## The demos
+;; ## The fixtures
 
-(def demos
+(def targets
   "Workload -> how to start the target, and a correct and a broken handler."
   {:register {:init    (constantly {})
               :correct (register-handler cas!)
@@ -187,7 +185,7 @@
               :broken  (bank-handler broken-transfer!)}})
 
 (defn config
-  "A run config for one workload. Options:
+  "A run config for one workload against these fixtures. Options:
 
      :variant     :correct (default) or :broken -- is the handler right?
      :durability  :durable (default) or :volatile -- does data survive a crash?
@@ -195,15 +193,15 @@
   ([workload] (config workload {}))
   ([workload {:keys [variant durability nemesis]
               :or   {variant :correct, durability :durable}}]
-   (let [demo (get demos workload)]
-     (assert demo (str "No demo for workload " (pr-str workload)))
+   (let [target (get targets workload)]
+     (assert target (str "No target for workload " (pr-str workload)))
      (cond-> {:adapter  ((case durability
                            :durable  adapter
                            :volatile volatile-adapter)
-                         (:init demo))
-              :handler  (get demo variant)
+                         (:init target))
+              :handler  (get target variant)
               :workload workload
-              :name     (str "jepsen-lite-demo-" (name workload))
+              :name     (str "jepsen-lite-test-" (name workload))
               :target   {:type :in-process}}
        nemesis (assoc :nemesis nemesis
                       ;; An in-memory target answers in microseconds, so these
@@ -211,39 +209,3 @@
                       ;; more often than a real run would, or the fault would
                       ;; land after everything already happened.
                       :nemesis-opts {:crashes 8, :crash-interval 1/500})))))
-
-(defn- parse-args
-  "Words in any order: a workload name, plus any of broken / crash / volatile."
-  [args]
-  (let [args (set args)]
-    [(or (first (filter (comp args name) (keys demos))) :register)
-     (cond-> {}
-       (args "broken")   (assoc :variant :broken)
-       (args "volatile") (assoc :durability :volatile)
-       (args "crash")    (assoc :nemesis [:crash]))]))
-
-(defn- expected-valid?
-  "What a well-wired Lite should say about this demo: only a broken handler, or
-   a target that loses data when it's crashed, should come back invalid."
-  [{:keys [variant durability nemesis]}]
-  (and (not= :broken variant)
-       (not (and (seq nemesis) (= :volatile durability)))))
-
-(defn -main
-  "`clojure -M:run [workload] [broken] [crash] [volatile]`, e.g.
-
-     clojure -M:run bank broken         ; a handler that loses money
-     clojure -M:run set crash           ; crashes, but the data survives them
-     clojure -M:run set crash volatile  ; crashes that take the data with them
-
-   Exits non-zero if the verdict isn't the one the demo is meant to produce."
-  [& args]
-  (let [[workload opts] (parse-args args)
-        {:keys [valid?]} (core/run (config workload opts))
-        labels (cond-> [(name workload)]
-                 (= :broken (:variant opts))      (conj "broken")
-                 (seq (:nemesis opts))            (conj "crash")
-                 (= :volatile (:durability opts)) (conj "volatile"))]
-    (println (str "\n" (str/join " " labels) ": :valid? " (pr-str valid?)))
-    (shutdown-agents)
-    (System/exit (if (= valid? (expected-valid? opts)) 0 1))))

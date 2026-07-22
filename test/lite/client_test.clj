@@ -1,7 +1,7 @@
 (ns lite.client-test
   (:require [clojure.test :refer [deftest is testing]]
             [lite.client :as client]
-            [lite.demo :as demo]))
+            [lite.targets :as targets]))
 
 (deftest complete-classifies-outcomes
   (let [op {:type :invoke, :f :read, :value nil, :process 0}]
@@ -33,7 +33,7 @@
              (select-keys (client/complete (fn [_ _] nil) nil op) [:f :process]))))))
 
 (deftest open-and-close-are-re-runnable
-  (let [a (demo/adapter (constantly {}))]
+  (let [a (targets/adapter (constantly {}))]
     (dotimes [_ 3]
       (let [conn (client/open a)]
         (is (some? conn))

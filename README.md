@@ -50,6 +50,11 @@ went wrong, why, and what to do instead. Only `:in-process` is runnable so far;
 its crash destroys the target instance and creates a new one, which is what
 `ClientAdapter`'s re-runnable `open`/`close` are for.
 
+The library is `src/`. The demo targets live in `examples/`, on the classpath
+only for the `:run` alias, so depending on jepsen-lite doesn't drag them in —
+and they use nothing a consumer couldn't. The test suite has its own fixtures in
+`test/` and never reads `examples/`.
+
 A user writes a **ClientAdapter**, a **handler**, and picks a `:workload`;
 `lite.core/run` returns `{:valid? ..., :results ..., :history ...}`. Each
 workload documents its handler contract in its own namespace — see

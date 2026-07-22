@@ -5,8 +5,13 @@
         jepsen/jepsen       {:mvn/version "0.3.12"}}
 
  :aliases
- {:run  {:main-opts ["-m" "lite.demo"]}
+ {;; The demo is example consumer code, not part of the library, so it is not
+  ;; on :paths -- it comes in only for these aliases.
+  :run  {:extra-paths ["examples"]
+         :main-opts   ["-m" "demo.kvs"]}
 
+  ;; Note the absence of "examples": the test suite stands on its own, on
+  ;; fixtures in test/. The demo is documentation, not a dependency of it.
   :test {:extra-paths ["test"]
          :extra-deps  {io.github.cognitect-labs/test-runner
                        {:git/tag "v0.5.1" :git/sha "dfb30dd"}}
