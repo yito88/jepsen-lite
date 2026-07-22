@@ -12,10 +12,12 @@ Two orthogonal axes:
 2. **target-type** — `:in-process` / `:local-process` / `:http` / `:compose`;
    the deploy / lifecycle method, which decides what faults can be injected.
 
-## Status: M0
+## Status: M1
 
-A hardcoded op list is run through an in-process ClientAdapter and the completed,
-`:type`-tagged ops are printed. No generator, checker, history, or store yet.
+Ops from a `jepsen.generator` flow through the user's ClientAdapter — bridged to
+`jepsen.client/Client` internally — and are recorded into a `jepsen.history` of
+paired `:invoke` → `:ok`/`:fail`/`:info` operations, which is printed and
+returned. No checker yet, and no real workloads.
 
     clojure -M:run     # runs the demo in src/lite/demo.clj
     clojure -M:test
@@ -23,3 +25,6 @@ A hardcoded op list is run through an in-process ClientAdapter and the completed
 Handlers signal outcomes by throwing: return normally for `:ok`, call
 `(lite.client/fail! msg)` for a certain failure, `(lite.client/info! reason)` for
 an indeterminate one. Any other exception is treated as `:info`.
+
+Runs write a store file under `store/` (gitignored). Jepsen's history writer
+requires it; nothing reads it back until the checker arrives.

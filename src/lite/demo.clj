@@ -1,9 +1,15 @@
 (ns lite.demo
   "A tiny worked example: an embedded single-register KVS, an in-process
    ClientAdapter for it, and a handler. This stands in for a user's real
-   embedded store and doubles as the M0 acceptance check."
-  (:require [lite.client :as client :refer [fail! info!]]
-            [lite.core :as core]))
+   embedded store and doubles as the M1 acceptance check.
+
+   Note what is *not* here: no `jepsen.client/Client`, no test map, no
+   generator interpreter. A user writes an adapter and a handler; Lite supplies
+   the rest."
+  (:require [jepsen.generator :as jgen]
+            [lite.client :as client :refer [fail! info!]]
+            [lite.core :as core]
+            [lite.gen :as gen]))
 
 ;; ## The stand-in target: a single register backed by an atom.
 
@@ -22,21 +28,28 @@
 ;;
 ;; It knows the KVS's calling convention and the connection lifecycle, and
 ;; nothing about how the KVS is deployed.
+;;
+;; The KVS instance lives in the adapter, not in a conn: Jepsen opens one client
+;; per worker process, and every worker must talk to the *same* register, the
+;; way real clients share one server. So `open` returns a handle to the shared
+;; instance, creating it if there isn't one, and `close` drops only the caller's
+;; handle. Both stay re-runnable, as M0 requires.
 
-(defrecord RegisterAdapter [handler]
+(defrecord RegisterAdapter [handler instance]
   client/ClientAdapter
   (open [_]
-    (open-kvs))
+    (swap! instance #(or % (open-kvs))))
 
   (invoke [_ conn op]
     (client/complete handler conn op))
 
   (close [_ _conn]
-    ;; The instance is garbage once the conn handle is dropped; nothing to do,
-    ;; and safe to call again.
+    ;; Dropping a client handle leaves the instance running. Discarding the
+    ;; instance itself is a fault, and belongs to the crash nemesis.
     nil))
 
-(defn adapter [] (map->RegisterAdapter {}))
+(defn adapter []
+  (map->RegisterAdapter {:instance (atom nil)}))
 
 ;; ## The handler: ops -> KVS calls.
 
@@ -51,16 +64,28 @@
                value
                (fail! "cas mismatch")))))
 
+;; ## The generator
+;;
+;; `lite.gen`'s read/write/cas mix, plus one demo-only op that pretends to time
+;; out, so the printed history shows an `:info` completion too.
+
+(defn timeout-w
+  "A write the demo target never answers."
+  [_test _ctx]
+  {:type :invoke, :f :write, :value (rand-int 5), :simulate :timeout})
+
+(def generator
+  (->> (jgen/mix [gen/r gen/w gen/cas timeout-w])
+       (jgen/stagger 1/1000)
+       (jgen/limit 32)
+       jgen/clients))
+
 (def config
-  {:adapter (adapter)
-   :handler handler
-   :ops     [{:f :write, :value 1}
-             {:f :read}
-             {:f :cas,   :value [1 2]}       ; matches -> :ok
-             {:f :cas,   :value [1 3]}       ; mismatches -> :fail
-             {:f :write, :value 4, :simulate :timeout} ; -> :info
-             {:f :read}]
-   :target  {:type :in-process}})
+  {:adapter   (adapter)
+   :handler   handler
+   :generator generator
+   :name      "jepsen-lite-demo"
+   :target    {:type :in-process}})
 
 (defn -main [& _args]
   (core/run config)

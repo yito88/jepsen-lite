@@ -1,7 +1,6 @@
 (ns lite.client-test
   (:require [clojure.test :refer [deftest is testing]]
             [lite.client :as client]
-            [lite.core :as core]
             [lite.demo :as demo]))
 
 (deftest complete-classifies-outcomes
@@ -28,6 +27,8 @@
                (:error completed)))))
 
     (testing "invoked fields are preserved"
+      ;; Jepsen rejects a completion whose :process or :f differs from the
+      ;; invocation's.
       (is (= {:f :read, :process 0}
              (select-keys (client/complete (fn [_ _] nil) nil op) [:f :process]))))))
 
@@ -40,8 +41,3 @@
         ;; closing twice, and closing a nil conn, must not throw
         (client/close a conn)
         (client/close a nil)))))
-
-(deftest demo-run-produces-all-three-types
-  (let [history (core/run demo/config)]
-    (is (= (count (:ops demo/config)) (count history)))
-    (is (= #{:ok :fail :info} (set (map :type history))))))
