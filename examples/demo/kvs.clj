@@ -192,9 +192,11 @@
 
      :variant     :correct (default) or :broken -- is the handler right?
      :durability  :durable (default) or :volatile -- does data survive a crash?
-     :nemesis     faults to inject, e.g. [:crash]"
+     :nemesis     faults to inject, e.g. [:crash]
+     :time-limit  how many seconds to run for
+     :concurrency how many workers to run"
   ([workload] (config workload {}))
-  ([workload {:keys [variant durability nemesis]
+  ([workload {:keys [variant durability nemesis time-limit concurrency]
               :or   {variant :correct, durability :durable}}]
    (let [demo (get demos workload)]
      (assert demo (str "No demo for workload " (pr-str workload)))
@@ -206,22 +208,31 @@
               :workload workload
               :name     (str "jepsen-lite-demo-" (name workload))
               :target   {:type :in-process}}
-       nemesis (assoc :nemesis nemesis
-                      ;; An in-memory target answers in microseconds, so these
-                      ;; runs are over in a few dozen milliseconds. Crash far
-                      ;; more often than a real run would, or the fault would
-                      ;; land after everything already happened.
-                      :nemesis-opts {:crashes 8, :crash-interval 1/500})))))
+       time-limit  (assoc :time-limit time-limit)
+       concurrency (assoc :concurrency concurrency)
+       nemesis     (assoc :nemesis nemesis)
+       ;; An in-memory target answers in microseconds, so a run with no time
+       ;; limit is over in a few dozen milliseconds. Crash far more often than
+       ;; a real run would, or the fault lands after everything already
+       ;; happened. Given a clock to run against, the ordinary defaults do.
+       (and nemesis (not time-limit))
+       (assoc :nemesis-opts {:crashes 8, :crash-interval 1/500})))))
 
 (defn- parse-args
-  "Words in any order: a workload name, plus any of broken / crash / volatile."
+  "Words in any order: a workload name, any of broken / crash / volatile, and
+   settings as key=value, e.g. time=10 concurrency=4."
   [args]
-  (let [args (set args)]
-    [(or (first (filter (comp args name) (keys demos))) :register)
+  (let [flags    (set (remove #(str/includes? % "=") args))
+        settings (into {} (map #(str/split % #"=" 2))
+                       (filter #(str/includes? % "=") args))
+        number   (fn [k] (some-> (get settings k) parse-long))]
+    [(or (first (filter (comp flags name) (keys demos))) :register)
      (cond-> {}
-       (args "broken")   (assoc :variant :broken)
-       (args "volatile") (assoc :durability :volatile)
-       (args "crash")    (assoc :nemesis [:crash]))]))
+       (flags "broken")     (assoc :variant :broken)
+       (flags "volatile")   (assoc :durability :volatile)
+       (flags "crash")      (assoc :nemesis [:crash])
+       (number "time")        (assoc :time-limit (number "time"))
+       (number "concurrency") (assoc :concurrency (number "concurrency")))]))
 
 (defn- expected-valid?
   "What a well-wired Lite should say about this demo: only a broken handler, or
@@ -231,20 +242,35 @@
        (not (and (seq nemesis) (= :volatile durability)))))
 
 (defn -main
-  "`clojure -M:run [workload] [broken] [crash] [volatile]`, e.g.
+  "`clojure -M:run [workload] [broken] [crash] [volatile] [time=s]
+   [concurrency=n]`, e.g.
 
      clojure -M:run bank broken         ; a handler that loses money
      clojure -M:run set crash           ; crashes, but the data survives them
      clojure -M:run set crash volatile  ; crashes that take the data with them
+     clojure -M:run bank time=10 concurrency=8
+
+   Without time=, the run ends after the workload's default op count -- a few
+   dozen milliseconds against an in-memory target.
 
    Exits non-zero if the verdict isn't the one the demo is meant to produce."
   [& args]
   (let [[workload opts] (parse-args args)
-        {:keys [valid?]} (core/run (config workload opts))
+        result (try
+                 (core/run (config workload opts))
+                 (catch clojure.lang.ExceptionInfo e
+                   ;; Lite's own refusals explain themselves; a stack trace on
+                   ;; top of that would only bury the explanation.
+                   (if (:lite/error (ex-data e))
+                     (do (println (str "\n" (ex-message e)))
+                         (shutdown-agents)
+                         (System/exit 2))
+                     (throw e))))
         labels (cond-> [(name workload)]
                  (= :broken (:variant opts))      (conj "broken")
                  (seq (:nemesis opts))            (conj "crash")
                  (= :volatile (:durability opts)) (conj "volatile"))]
-    (println (str "\n" (str/join " " labels) ": :valid? " (pr-str valid?)))
+    (println (str "\n" (str/join " " labels) ": :valid? "
+                  (pr-str (:valid? result))))
     (shutdown-agents)
-    (System/exit (if (= valid? (expected-valid? opts)) 0 1))))
+    (System/exit (if (= (:valid? result) (expected-valid? opts)) 0 1))))

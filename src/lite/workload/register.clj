@@ -55,14 +55,15 @@
      :per-key-limit  Max ops per register (default 20). Keep this small: it
                      bounds the length of each history Knossos must check.
      :process-limit  Max processes touching one register (default 10).
-     :op-limit       Total ops, which is what ends the run (default 100); the
-                     underlying generator walks an unbounded key sequence."
+     :op-limit       Total ops (default 100), or false for as many as the run
+                     has time for; the underlying generator walks an unbounded
+                     key sequence, so one bound or the other has to end it."
   [{:keys [nodes per-key-limit process-limit op-limit]
     :or   {per-key-limit 20, process-limit 10, op-limit 100}}]
-  {:generator   (gen/limit op-limit
-                           (:generator (lr/test {:nodes         nodes
-                                                 :per-key-limit per-key-limit
-                                                 :process-limit process-limit})))
+  {:generator   (cond->> (:generator (lr/test {:nodes         nodes
+                                               :per-key-limit per-key-limit
+                                               :process-limit process-limit}))
+                  op-limit (gen/limit op-limit))
    :checker     (independent/checker
                  (checker/compose
                   {:linearizable (checker/linearizable
@@ -71,5 +72,7 @@
                    :timeline     (timeline/html)}))
    :wrap-client ->PerKeyClient
    ;; Keys are worked on by groups of 2 threads per node, and the generator
-   ;; insists the worker count divide evenly into groups.
-   :concurrency (* 2 (count nodes))})
+   ;; insists the worker count divide evenly into groups -- so a caller who
+   ;; picks their own :concurrency has to pick a multiple of the group size.
+   :concurrency          (* 2 (count nodes))
+   :concurrency-multiple (* 2 (count nodes))})

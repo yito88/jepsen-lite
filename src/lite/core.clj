@@ -36,16 +36,51 @@
     (nemesis/validate! (:type target) nemesis))
   nil)
 
+(defn- check-concurrency!
+  "Some workloads split workers into fixed-size groups and need a worker count
+   that divides evenly. Say so plainly rather than letting an assertion fire
+   from inside the generator."
+  [workload-name {:keys [concurrency-multiple]} concurrency]
+  (when (and concurrency-multiple
+             (pos? concurrency-multiple)
+             (not (zero? (mod concurrency concurrency-multiple))))
+    (throw (ex-info
+            (str "The " workload-name " workload can't run with :concurrency "
+                 concurrency ".\n\n"
+                 "  why: it works each key with a group of " concurrency-multiple
+                 " threads, so the worker count has to divide into whole"
+                 " groups.\n\n"
+                 "  fix: use a multiple of " concurrency-multiple ", such as "
+                 (* concurrency-multiple (max 1 (quot concurrency
+                                                      concurrency-multiple)))
+                 " or " (* concurrency-multiple
+                           (inc (quot concurrency concurrency-multiple)))
+                 ", or leave :concurrency out and let the workload choose.")
+            {:lite/error  :invalid-concurrency
+             :workload    workload-name
+             :concurrency concurrency
+             :multiple    concurrency-multiple})))
+  concurrency)
+
 (defn test-map
   "Builds the Jepsen test map for `config`. Everything not named here keeps
    `noop-test`'s defaults: a noop os/db is correct for an in-process target,
    which has no node to configure."
-  [{:keys [adapter handler workload workload-opts concurrency name nodes
-           target nemesis nemesis-opts]}]
+  [{:keys [adapter handler workload workload-opts concurrency time-limit name
+           nodes target nemesis nemesis-opts]}]
   (let [nodes   (or nodes default-nodes)
         target  (or target default-target)
-        w       (workload/build (or workload :register)
-                                (assoc workload-opts :nodes nodes))
+        w-name  (or workload :register)
+        w       (workload/build w-name
+                                (cond-> (assoc workload-opts :nodes nodes)
+                                  ;; With a clock to run against, let the ops
+                                  ;; run until time is up rather than stopping
+                                  ;; at a workload's default op count.
+                                  (and time-limit
+                                       (not (contains? workload-opts :op-limit)))
+                                  (assoc :op-limit false)))
+        concurrency (check-concurrency!
+                     w-name w (or concurrency (:concurrency w) (count nodes)))
         ;; `invoke` takes no handler argument, so the adapter carries it. The
         ;; config is the user-facing place to put it; bind it in here.
         adapter (cond-> adapter handler (assoc :handler handler))
@@ -59,12 +94,21 @@
            {:pure-generators true
             :name            (or name "jepsen-lite")
             :nodes           nodes
-            :concurrency     (or concurrency (:concurrency w) (count nodes))
+            :concurrency     concurrency
             :client          (cond-> (bridge/client adapter conn)
                                (:wrap-client w) ((:wrap-client w)))
-            :generator       (if nem
-                               (gen/nemesis (:generator nem) (:generator w))
-                               (:generator w))
+            :generator       (let [client-gen
+                                   (cond-> (cond->> (:generator w)
+                                             time-limit (gen/time-limit
+                                                         time-limit))
+                                     ;; Whatever the workload needs to do once
+                                     ;; the ops are over -- a final read, say --
+                                     ;; happens after the clock stops.
+                                     (:final-generator w)
+                                     (gen/phases (:final-generator w)))]
+                               (if nem
+                                 (gen/nemesis (:generator nem) client-gen)
+                                 client-gen))
             :checker         (:checker w)}
            (when nem {:nemesis (:nemesis nem)}))))
 
@@ -84,6 +128,8 @@
       :workload      :register          ; optional; :register is the default
       :workload-opts {...}              ; optional; see the workload's ns
       :concurrency   <n>                ; optional; the workload picks otherwise
+      :time-limit    <seconds>          ; optional; otherwise the run ends after
+                                        ; the workload's op count
       :name          \"...\"            ; optional
       :target        {:type :in-process} ; optional; :in-process is the default
       :nemesis       [:crash]           ; optional; faults to inject

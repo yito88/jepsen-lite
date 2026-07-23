@@ -31,7 +31,21 @@ Each ships a correct demo target and a deliberately broken one:
     clojure -M:run bank broken         # <workload> [broken] [crash] [volatile]
     clojure -M:run set crash           # crashes, data survives -> :valid? true
     clojure -M:run set crash volatile  # crashes lose data     -> :valid? false
+    clojure -M:run bank time=10 concurrency=8
     clojure -M:test
+
+## How long, and how many workers
+
+    (lite.core/run {..., :time-limit 10, :concurrency 8})
+
+`:time-limit` is in seconds, and replaces the workload's default op count, so a
+run lasts as long as you asked rather than stopping after a few hundred ops.
+Anything the workload has to do at the end — `:set`'s final read — still runs
+after the clock stops. Without a time limit, the op count ends the run.
+
+`:concurrency` is how many workers issue ops; leave it out and the workload
+picks. `:register` works each key with a group of threads and needs a multiple
+of the group size, and says so if given something else.
 
 ## Faults
 

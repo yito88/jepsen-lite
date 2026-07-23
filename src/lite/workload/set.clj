@@ -22,9 +22,13 @@
 (defn workload
   "Options:
 
-     :op-limit  How many adds to attempt (default 200)."
+     :op-limit  How many adds to attempt (default 200), or false for as many
+                as the run has time for."
   [{:keys [op-limit] :or {op-limit 200}}]
-  {:generator   (gen/phases (gen/clients (gen/limit op-limit (adds)))
-                            (gen/clients (gen/once {:f :read})))
-   :checker     (checker/set)
-   :concurrency 4})
+  {:generator (gen/clients (cond->> (adds)
+                             op-limit (gen/limit op-limit)))
+   ;; The read runs after the adds are done, and after any time limit has
+   ;; expired: without it there is nothing to check the adds against.
+   :final-generator (gen/clients (gen/once {:f :read}))
+   :checker         (checker/set)
+   :concurrency     4})

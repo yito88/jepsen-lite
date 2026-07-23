@@ -4,6 +4,8 @@
    A workload is a map:
 
      :generator    the op stream
+     :final-generator  optional; ops to run once the op stream is done and any
+                   time limit has expired, such as a final read
      :checker      the verdict over the resulting history
      :wrap-client  optional (fn [client] client'), for workloads whose ops need
                    translating before the user's handler sees them

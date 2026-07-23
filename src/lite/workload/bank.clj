@@ -23,12 +23,14 @@
 (defn workload
   "Options:
 
-     :op-limit           Total ops (default 200).
+     :op-limit           Total ops (default 200), or false for as many as the
+                         run has time for.
      :negative-balances? If true, balances may go below zero (default false)."
   [{:keys [op-limit negative-balances?]
     :or   {op-limit 200, negative-balances? false}}]
   (let [defaults (bank/test {:negative-balances? negative-balances?})]
-    {:generator   (gen/clients (gen/limit op-limit (:generator defaults)))
+    {:generator   (gen/clients (cond->> (:generator defaults)
+                                 op-limit (gen/limit op-limit)))
      ;; bank/test also composes in a gnuplot-backed plotter; the invariant is
      ;; the part that decides the verdict, and it needs no external tools.
      :checker     (bank/checker {:negative-balances? negative-balances?})

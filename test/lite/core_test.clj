@@ -74,3 +74,31 @@
 
 (deftest unknown-workload-is-rejected
   (is (thrown? clojure.lang.ExceptionInfo (workload/build :nope {}))))
+
+(deftest a-run-can-be-given-a-clock-and-a-worker-count
+  (let [seconds 1/2
+        {:keys [valid? history]} (core/run (assoc (targets/config :set)
+                                                  :time-limit seconds
+                                                  :concurrency 8))
+        elapsed-ms (/ (:time (last history)) 1e6)]
+    (testing "it runs for about as long as asked"
+      (is (<= (* 1000 seconds) elapsed-ms (+ 500 (* 1000 seconds)))))
+
+    (testing "with the workers asked for"
+      (is (= 8 (count (distinct (filter number? (map :process history)))))))
+
+    (testing "and the time limit replaces the workload's op count"
+      ;; The default is 200 adds; half a second buys far more than that.
+      (is (< 1000 (count history))))
+
+    (testing "without cutting off what the workload needs to do last"
+      ;; :set's final read runs after the clock stops -- without it there is
+      ;; nothing to check the adds against, and the verdict is :unknown.
+      (is (true? valid?)))))
+
+(deftest a-worker-count-a-workload-cannot-use-is-rejected
+  (let [e (is (thrown? clojure.lang.ExceptionInfo
+                       (core/run (assoc (targets/config :register)
+                                        :concurrency 5))))]
+    (is (= :invalid-concurrency (:lite/error (ex-data e))))
+    (is (re-find #"multiple of 2" (ex-message e)))))

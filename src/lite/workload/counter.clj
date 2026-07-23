@@ -22,8 +22,10 @@
 (defn workload
   "Options:
 
-     :op-limit  Total ops (default 200)."
+     :op-limit  Total ops (default 200), or false for as many as the run has
+                time for."
   [{:keys [op-limit] :or {op-limit 200}}]
-  {:generator   (gen/clients (gen/limit op-limit (gen/mix [add add r])))
+  {:generator   (gen/clients (cond->> (gen/mix [add add r])
+                               op-limit (gen/limit op-limit)))
    :checker     (checker/counter)
    :concurrency 4})
