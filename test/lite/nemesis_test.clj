@@ -112,6 +112,37 @@
       (is (= 42 (:value (invoke {:type :invoke, :f :read, :key :k}))))
       (is (= 6 (in-process/crash-count conn))))))
 
+(deftest replacement-client-waits-for-graceful-close
+  ;; A crash publishes nil while it closes the old instance. Jepsen may replace
+  ;; clients whose ops landed in that window; their open! calls must not create a
+  ;; second live instance before the old one's graceful close has completed.
+  (let [opens         (atom 0)
+        close-started (promise)
+        allow-close   (promise)
+        reopened      (promise)
+        adapter       (reify client/ClientAdapter
+                        (open [_]
+                          (let [instance (swap! opens inc)]
+                            (when (> instance 1) (deliver reopened instance))
+                            instance))
+                        (invoke [_ _conn op] op)
+                        (close [_ _conn]
+                          (deliver close-started true)
+                          @allow-close))
+        conn          (target/build {:type :in-process} adapter)]
+    (target/acquire! conn)
+    (let [crashing  (future (in-process/crash! conn))
+          _         @close-started
+          acquiring (future (target/acquire! conn))]
+      (is (= ::not-opened (deref reopened 100 ::not-opened))
+          "a replacement client must not open while graceful close is running")
+      (deliver allow-close true)
+      @crashing
+      @acquiring
+      (is (= 2 @opens) "initial startup plus exactly one crash replacement")
+      (is (= 2 (target/current conn))
+          "every replacement client shares the instance opened by crash!"))))
+
 (deftest a-target-that-survives-crashes-still-checks-out
   (is (true? (:valid? @durable))))
 
