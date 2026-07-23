@@ -28,9 +28,9 @@ workload's checker → a verdict. All four v1 workloads are in:
 Each ships a correct demo target and a deliberately broken one:
 
     clojure -M:run                     # correct register -> :valid? true
-    clojure -M:run bank broken         # <workload> [broken] [crash] [volatile]
-    clojure -M:run set crash           # crashes, data survives -> :valid? true
-    clojure -M:run set crash volatile  # crashes lose data     -> :valid? false
+    clojure -M:run bank broken         # <workload> [broken] [crash] [buggy]
+    clojure -M:run set crash           # survives crashes    -> :valid? true
+    clojure -M:run set crash buggy     # loses acked writes  -> :valid? false
     clojure -M:run bank time=10 concurrency=8
     clojure -M:test
 
@@ -60,9 +60,21 @@ possible depends on how the target is deployed, not on the workload:
 | `:compose` | ✓ | ✓ | ✓ |
 
 Asking for one of the ✗ combinations stops the run before it starts, with what
-went wrong, why, and what to do instead. Only `:in-process` is runnable so far;
-its crash destroys the target instance and creates a new one, which is what
-`ClientAdapter`'s re-runnable `open`/`close` are for.
+went wrong, why, and what to do instead. Only `:in-process` is runnable so far.
+
+Its crash destroys the target instance and creates a new one — `close` then
+`open` — which is what `ClientAdapter`'s re-runnable lifecycle is for. **`open`
+attaches to durable state; it must not create or reset it.** A store that
+persists therefore survives a crash with its committed data intact, and the
+checker passes. When acknowledged writes go missing afterwards, that's a
+durability bug in the target, and the checker says so. Lite doesn't decide what
+should survive — it crashes the target, records what happened, and lets the
+checker rule.
+
+Whatever initial state a workload needs, the workload writes itself, through the
+same handler as every other op — `:bank` opens its accounts with an `:init` op
+in a first generator phase. Adapters stay workload-agnostic, and initialization
+doesn't silently re-run on every crash.
 
 The library is `src/`. The demo targets live in `examples/`, on the classpath
 only for the `:run` alias, so depending on jepsen-lite doesn't drag them in —

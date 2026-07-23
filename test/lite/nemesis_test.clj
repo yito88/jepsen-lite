@@ -3,9 +3,11 @@
    validation refuses the combinations that can't work."
   (:require [clojure.string :as str]
             [clojure.test :refer [deftest is testing]]
+            [lite.client :as client]
             [lite.core :as core]
             [lite.nemesis :as nemesis]
             [lite.target :as target]
+            [lite.target.in-process :as in-process]
             [lite.targets :as targets]))
 
 ;; ## Axis-2 validation
@@ -86,12 +88,38 @@
         (is (some (fn [op] (and (= :ok (:type op)) (number? (:process op))))
                   after))))))
 
+(deftest a-crash-does-not-take-committed-data-with-it
+  ;; The heart of M4.5: `open` attaches to durable state, it does not create or
+  ;; reset it, so destroying and re-creating the instance is survivable. If
+  ;; `open` ever starts seeding again, this is what catches it.
+  (let [adapter (assoc (targets/adapter)
+                       :handler (fn [kvs {:keys [f key value]}]
+                                  (case f
+                                    :write (do (swap! kvs assoc key value) value)
+                                    :read  (get @kvs key))))
+        conn    (target/build {:type :in-process} adapter)
+        invoke  (fn [op] (client/invoke adapter (target/current conn) op))]
+    (target/acquire! conn)
+    (is (= :ok (:type (invoke {:type :invoke, :f :write, :key :k, :value 42}))))
+
+    (in-process/crash! conn)
+
+    (testing "the write survives, and the client follows the new instance"
+      (is (= 42 (:value (invoke {:type :invoke, :f :read, :key :k})))))
+
+    (testing "and keeps surviving, crash after crash"
+      (dotimes [_ 5] (in-process/crash! conn))
+      (is (= 42 (:value (invoke {:type :invoke, :f :read, :key :k}))))
+      (is (= 6 (in-process/crash-count conn))))))
+
 (deftest a-target-that-survives-crashes-still-checks-out
   (is (true? (:valid? @durable))))
 
-(deftest a-target-that-loses-data-when-crashed-is-caught
+(deftest a-durability-bug-is-caught
+  ;; A store that acknowledges writes before they are durable: the defect crash
+  ;; testing exists to find, standing in for a missing fsync or an unflushed WAL.
   (let [{:keys [valid? results]} (core/run (targets/config :set {:nemesis [:crash]
-                                                                 :durability :volatile}))]
+                                                                 :durability :buggy}))]
     (is (false? valid?))
     (testing "as lost writes, not as an error"
       (is (pos? (:lost-count results)))

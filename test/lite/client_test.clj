@@ -33,7 +33,7 @@
              (select-keys (client/complete (fn [_ _] nil) nil op) [:f :process]))))))
 
 (deftest open-and-close-are-re-runnable
-  (let [a (targets/adapter (constantly {}))]
+  (let [a (targets/adapter)]
     (dotimes [_ 3]
       (let [conn (client/open a)]
         (is (some? conn))
@@ -41,3 +41,10 @@
         ;; closing twice, and closing a nil conn, must not throw
         (client/close a conn)
         (client/close a nil)))))
+
+(deftest open-attaches-to-durable-state-rather-than-creating-it
+  ;; Reopening must land on the same data: the crash nemesis is close then open.
+  (let [a (targets/adapter)]
+    (swap! (client/open a) assoc :k 42)
+    (client/close a (client/open a))
+    (is (= 42 (:k @(client/open a))))))

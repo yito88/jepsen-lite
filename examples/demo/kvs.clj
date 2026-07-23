@@ -1,8 +1,12 @@
 (ns demo.kvs
-  "Worked examples: for each workload, an embedded key-value target that is
-   correct and one with a deliberate defect. Running both is how we know a
-   checker discriminates -- a checker that only ever passes has not been shown
-   to work.
+  "Worked examples: in-memory stand-ins for a persistent key-value store. One
+   behaves; one has a broken handler; one *simulates a durability bug* by
+   acknowledging writes before they are durable and losing them when it crashes.
+   Running them against each other is how we know the checkers discriminate.
+
+   The last one is a foil, not a portrait of a normal store: a persistent KVS is
+   expected to survive a crash with its committed data intact, and that is the
+   headline case here.
 
    This is not part of the library. It lives outside `src` and uses nothing a
    user of jepsen-lite couldn't: an adapter, a handler, and a workload choice.
@@ -11,61 +15,68 @@
             [lite.client :as client :refer [fail!]]
             [lite.core :as core]))
 
-;; ## The adapter
+;; ## The adapters
 ;;
-;; One adapter serves every demo: it knows the calling convention of an
-;; in-memory store (an atom holding some state) and the connection lifecycle,
-;; and nothing about how that store is deployed.
+;; One adapter serves every workload: it knows the calling convention of a
+;; key-value store and the connection lifecycle, and nothing about which
+;; workload is running or how the store is deployed. The store starts empty;
+;; whatever initial state a workload needs, the workload writes for itself.
 ;;
-;; The instance lives in the adapter, not in a conn: Jepsen opens one client per
-;; worker process, and every worker must talk to the *same* store, the way real
-;; clients share one server. So `open` returns a handle to the shared instance,
-;; creating it if there isn't one, and `close` drops only the caller's handle.
-;; Both stay re-runnable, as the crash nemesis will need.
+;; The store is created once, when the adapter is built -- the way a persistent
+;; KVS's data directory outlives any one instance of the process. `open` only
+;; *attaches* to it. That is what makes a crash (close, then open) durable by
+;; default, which is the honest default for a store that persists.
 
-(defrecord Adapter [handler init instance]
+(defrecord Adapter [handler store]
   client/ClientAdapter
   (open [_]
-    ;; Durable: the data lives outside any one instance, so a crash costs the
-    ;; connection but not what was committed through it.
-    (swap! instance #(or % (atom (init)))))
+    ;; Attach to the durable state. Note what is absent: any creation or
+    ;; resetting of data. A crash re-enters here and finds what was committed.
+    store)
 
   (invoke [_ conn op]
     (client/complete handler conn op))
 
   (close [_ _conn]
-    ;; Dropping a client handle leaves the data where it is. Discarding the
-    ;; instance is a fault, and belongs to the crash nemesis.
     nil))
 
-(defrecord VolatileAdapter [handler init]
+(defrecord UnsoundAdapter [handler durable flush-every ops]
   client/ClientAdapter
   (open [_]
-    ;; The defect this one is here to show: the data lives *in* the instance, so
-    ;; every crash starts from nothing and acknowledged writes evaporate.
-    (atom (init)))
+    ;; Recovery: whatever reached durable storage. Anything acknowledged since
+    ;; the last flush is gone -- which is the bug this fixture exists to
+    ;; simulate, not how a correct store behaves.
+    (atom @durable))
 
   (invoke [_ conn op]
-    (client/complete handler conn op))
+    (let [completed (client/complete handler conn op)]
+      ;; The defect: the write is acknowledged above, and only *sometimes*
+      ;; actually made durable. A target with a missing fsync, or a WAL it never
+      ;; flushes, loses exactly this way.
+      (when (zero? (mod (swap! ops inc) flush-every))
+        (reset! durable @conn))
+      completed))
 
   (close [_ _conn]
     nil))
 
 (defn adapter
-  "A target whose data survives a crash."
-  [init]
-  (map->Adapter {:init init, :instance (atom nil)}))
+  "A store that persists: what it acknowledged, it keeps."
+  []
+  (map->Adapter {:store (atom {})}))
 
-(defn volatile-adapter
-  "A target whose data does not."
-  [init]
-  (map->VolatileAdapter {:init init}))
+(defn unsound-adapter
+  "A store that acknowledges writes before they are durable and loses the
+   unflushed ones when it crashes. This simulates a bug in a target -- the thing
+   crash testing exists to catch, not the normal behaviour of a persistent
+   store."
+  ([] (unsound-adapter 20))
+  ([flush-every]
+   (map->UnsoundAdapter {:durable     (atom {})
+                         :flush-every flush-every
+                         :ops         (atom 0)})))
 
-;; ## :register -- a map of keys to registers
-;;
-;; `:value` is the payload for one register; `:key` says which one. A CAS
-;; mismatch is a *certain* failure, so it calls `fail!` -- and a history full of
-;; those is still perfectly linearizable.
+;; ## :register -- one register per key
 
 (defn- cas!
   "Sets k to `new` if it holds `old`. Returns true if it did."
@@ -96,56 +107,54 @@
                  value
                  (fail! "cas mismatch"))))))
 
-;; ## :set -- a growing collection
+;; ## :set -- a growing collection under one key
 
-(defn- set-handler [add-fn]
-  (fn [s {:keys [f value]}]
-    (case f
-      :add  (do (add-fn s value) value)
-      :read (vec @s))))
-
-(defn- add! [s element]
-  (swap! s conj element))
+(defn- add! [kvs element]
+  (swap! kvs update :elements (fnil conj []) element))
 
 (defn- broken-add!
   "The defect: silently drops every fifth element. The add is acknowledged, so
    the checker counts the element as one the target promised to keep."
-  [s element]
+  [kvs element]
   (when-not (zero? (mod element 5))
-    (swap! s conj element)))
+    (swap! kvs update :elements (fnil conj []) element)))
 
-;; ## :counter -- a monotonic integer
-
-(defn- counter-handler [add-fn]
-  (fn [c {:keys [f value]}]
+(defn- set-handler [add-fn]
+  (fn [kvs {:keys [f value]}]
     (case f
-      :add  (do (add-fn c value) value)
-      :read (long @c))))
+      :add  (do (add-fn kvs value) value)
+      :read (get @kvs :elements []))))
 
-(defn- increment! [c amount]
-  (swap! c + amount))
+;; ## :counter -- a monotonic integer under one key
+
+(defn- increment! [kvs amount]
+  (swap! kvs update :counter (fnil + 0) amount))
 
 (defn- broken-increment!
   "The defect: credits only half of each increment, rounding down, so the
    counter drifts far below the sum of the increments it acknowledged."
-  [c amount]
-  (swap! c + (quot amount 2)))
+  [kvs amount]
+  (swap! kvs update :counter (fnil + 0) (quot amount 2)))
+
+(defn- counter-handler [add-fn]
+  (fn [kvs {:keys [f value]}]
+    (case f
+      :add  (do (add-fn kvs value) value)
+      :read (long (get @kvs :counter 0)))))
 
 ;; ## :bank -- accounts whose total must never change
 ;;
-;; The one demo that needs transactions: a transfer touches two accounts, and a
-;; read that lands mid-transfer must still see the full total.
-
-(def accounts
-  "Every account starts empty except the first, which holds the lot."
-  (into {0 100} (map (fn [a] [a 0])) (range 1 8)))
+;; The one workload that needs transactions: a transfer touches two accounts,
+;; and a read that lands mid-transfer must still see the full total. The opening
+;; balances arrive as an ordinary `:init` op from the workload's first phase --
+;; the adapter knows nothing about them.
 
 (defn- transfer!
   "Debits and credits in one atomic step."
   [accts {:keys [from to amount]}]
   (let [[before after]
         (swap-vals! accts (fn [m]
-                            (if (<= amount (get m from))
+                            (if (<= amount (get m from 0))
                               (-> m (update from - amount) (update to + amount))
                               m)))]
     (if (= before after)
@@ -157,7 +166,7 @@
    transfer destroys money and the total stops adding up."
   [accts {:keys [from amount]}]
   (let [[before after] (swap-vals! accts (fn [m]
-                                           (if (<= amount (get m from))
+                                           (if (<= amount (get m from 0))
                                              (update m from - amount)
                                              m)))]
     (if (= before after)
@@ -167,43 +176,41 @@
 (defn- bank-handler [transfer-fn]
   (fn [accts {:keys [f value]}]
     (case f
+      :init     (do (swap! accts merge value) value)
       :read     @accts
       :transfer (transfer-fn accts value))))
 
 ;; ## The demos
 
 (def demos
-  "Workload -> how to start the target, and a correct and a broken handler."
-  {:register {:init    (constantly {})
-              :correct (register-handler cas!)
+  "Workload -> a correct handler and one with a defect. Note what isn't here:
+   any initial state. The store starts empty and each workload seeds its own."
+  {:register {:correct (register-handler cas!)
               :broken  (register-handler broken-cas!)}
-   :set      {:init    (constantly [])
-              :correct (set-handler add!)
+   :set      {:correct (set-handler add!)
               :broken  (set-handler broken-add!)}
-   :counter  {:init    (constantly 0)
-              :correct (counter-handler increment!)
+   :counter  {:correct (counter-handler increment!)
               :broken  (counter-handler broken-increment!)}
-   :bank     {:init    (constantly accounts)
-              :correct (bank-handler transfer!)
+   :bank     {:correct (bank-handler transfer!)
               :broken  (bank-handler broken-transfer!)}})
 
 (defn config
   "A run config for one workload. Options:
 
      :variant     :correct (default) or :broken -- is the handler right?
-     :durability  :durable (default) or :volatile -- does data survive a crash?
+     :durability  :sound (default) or :buggy -- does the store keep what it
+                  acknowledged, when it is crashed?
      :nemesis     faults to inject, e.g. [:crash]
      :time-limit  how many seconds to run for
      :concurrency how many workers to run"
   ([workload] (config workload {}))
   ([workload {:keys [variant durability nemesis time-limit concurrency]
-              :or   {variant :correct, durability :durable}}]
+              :or   {variant :correct, durability :sound}}]
    (let [demo (get demos workload)]
      (assert demo (str "No demo for workload " (pr-str workload)))
-     (cond-> {:adapter  ((case durability
-                           :durable  adapter
-                           :volatile volatile-adapter)
-                         (:init demo))
+     (cond-> {:adapter  (case durability
+                          :sound (adapter)
+                          :buggy (unsound-adapter))
               :handler  (get demo variant)
               :workload workload
               :name     (str "jepsen-lite-demo-" (name workload))
@@ -219,7 +226,7 @@
        (assoc :nemesis-opts {:crashes 8, :crash-interval 1/500})))))
 
 (defn- parse-args
-  "Words in any order: a workload name, any of broken / crash / volatile, and
+  "Words in any order: a workload name, any of broken / crash / buggy, and
    settings as key=value, e.g. time=10 concurrency=4."
   [args]
   (let [flags    (set (remove #(str/includes? % "=") args))
@@ -229,25 +236,26 @@
     [(or (first (filter (comp flags name) (keys demos))) :register)
      (cond-> {}
        (flags "broken")     (assoc :variant :broken)
-       (flags "volatile")   (assoc :durability :volatile)
+       (flags "buggy")      (assoc :durability :buggy)
        (flags "crash")      (assoc :nemesis [:crash])
        (number "time")        (assoc :time-limit (number "time"))
        (number "concurrency") (assoc :concurrency (number "concurrency")))]))
 
 (defn- expected-valid?
   "What a well-wired Lite should say about this demo: only a broken handler, or
-   a target that loses data when it's crashed, should come back invalid."
+   a store that loses acknowledged writes when it's crashed, should come back
+   invalid."
   [{:keys [variant durability nemesis]}]
   (and (not= :broken variant)
-       (not (and (seq nemesis) (= :volatile durability)))))
+       (not (and (seq nemesis) (= :buggy durability)))))
 
 (defn -main
-  "`clojure -M:run [workload] [broken] [crash] [volatile] [time=s]
+  "`clojure -M:run [workload] [broken] [crash] [buggy] [time=s]
    [concurrency=n]`, e.g.
 
      clojure -M:run bank broken         ; a handler that loses money
-     clojure -M:run set crash           ; crashes, but the data survives them
-     clojure -M:run set crash volatile  ; crashes that take the data with them
+     clojure -M:run set crash           ; a store that survives crashes
+     clojure -M:run set crash buggy     ; one that loses unflushed writes
      clojure -M:run bank time=10 concurrency=8
 
    Without time=, the run ends after the workload's default op count -- a few
@@ -269,7 +277,7 @@
         labels (cond-> [(name workload)]
                  (= :broken (:variant opts))      (conj "broken")
                  (seq (:nemesis opts))            (conj "crash")
-                 (= :volatile (:durability opts)) (conj "volatile"))]
+                 (= :buggy (:durability opts))    (conj "buggy"))]
     (println (str "\n" (str/join " " labels) ": :valid? "
                   (pr-str (:valid? result))))
     (shutdown-agents)
